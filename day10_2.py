@@ -148,6 +148,8 @@ def findMinimumSteps(matrix):
     # This explores the entire search space and finds the minimum solution
 
     # the original problem matrix is nice and all positive numbers, letting us bound our search candidates
+    startTime = time.perf_counter_ns()
+
     constraintMatrix = matrix.copy()
 
     def computeNewContraintMatrix(matrix, coefficientIdx, coefficient):
@@ -162,7 +164,9 @@ def findMinimumSteps(matrix):
     
     steps, coefficients, matrix = result
     if None not in coefficients:
-        return (0, steps)
+        now = time.perf_counter_ns()
+
+        return (0, steps, (now - startTime) / (1000000000 / 1000))
     
     constraintMatrix = constraintMatrix.copy()
     for i, c in enumerate(coefficients):
@@ -171,8 +175,6 @@ def findMinimumSteps(matrix):
 
     iterations = 0
 
-
-    startTime = time.perf_counter_ns()
     lastTime = startTime
     isSlow = False
 
@@ -196,7 +198,13 @@ def findMinimumSteps(matrix):
             return None
 
         assert(len(holes) > 0)
-        holeIdx = holes[0]
+
+        # switching form holes[0] to holes[-1] speeds up from ~27s -> ~9s!!
+        # I hypothesized this was an optimization because after getting the matrix 'optimized' as closed to reduced row echelon form
+        # the free independent variables would be on the right side, vs on the left
+        # This would mean that if we started our DFS from the right side, we should hit the 'propgation' steps with less choices made
+        holeIdx = holes[-1]
+
         holeMax = min(constraintMatrix[j, -1] for j, r in enumerate(constraintMatrix[:, holeIdx]) if r > 0)
 
         solutionFound = None
@@ -270,8 +278,7 @@ def findMinimumSteps(matrix):
     result = helper(matrix, coefficients, holes, constraintMatrix, steps)
 
     now = time.perf_counter_ns()
-    print(f"  Finished in {(now - startTime) / (1000000000 / 1000)}ms")
-    return (iterations, result)
+    return (iterations, result, (now - startTime) / (1000000000 / 1000))
 
 def main():
     machines = []
@@ -301,19 +308,19 @@ def main():
     sum = 0
     machines = machines
     startTime = time.perf_counter_ns()
+    print("| Machine | Presses | Time(ms) | Iterations |")
+    print("|---------|---------|----------|------------|")
     for i, m in enumerate(machines):
-        print(f"Working on machine {i}")
-        iters, steps = findMinimumSteps(machineToMatrixForm(m))
-        if iters == 0:
-            print(f"Solved {steps} total steps needed")
-        else:
-            print(f"Solved {steps} total steps needed in {iters} iterations")
+        iters, steps, msElapsed = findMinimumSteps(machineToMatrixForm(m))
+        print(f"|{i: 9}|{steps: 9}|{msElapsed: 10}|{iters: 12}|")
         sum += steps
     endTime = time.perf_counter_ns()
+    print("|---------|---------|----------|------------|")
+    print("| Machine | Presses | Time(ms) | Iterations |")
+    print()
     elapsed = endTime - startTime
     elapsedInSecs = elapsed / 1000000000
-    print(f"Solved in {elapsedInSecs} seconds!")
-    print(f"Total is {sum}")
+    print(f"Total presses: {sum} (elasped: {elapsedInSecs} seconds)")
 
 if __name__ == '__main__':
     main()
