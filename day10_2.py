@@ -13,7 +13,7 @@ def machineToMatrixForm(machine):
         matrix[j, -1] = joltages[j]
     return matrix
 
-def solveSimpleCoefficients(matrix, debug = False):
+def solveSimpleCoefficients(matrix, solvedCoefficients):
     # finds trivial solutions to coefficients
     # if there is a row of the form
     # 0 0 0 .. x .. 0 0 y
@@ -23,8 +23,7 @@ def solveSimpleCoefficients(matrix, debug = False):
     # else, returns (sumOfSolvedCoefficients, matrix)
     #  - sum of solved coefficients is used to calculate how many steps / button presses it took to get to matrix
     #  - matrix is the left unsolved that needs more exploration
-    sumOfSolvedCoefficients = None
-    solvedCoefficients = [None] * (matrix.shape[1] - 1)
+    sumOfSolvedCoefficients = 0
     solving = True
     while solving:
         solving = False
@@ -36,9 +35,11 @@ def solveSimpleCoefficients(matrix, debug = False):
             # scan the coefficients in the row for a non zero
             for i, c in enumerate(coefficients):
                 if c != 0:
+                    nonZerosFound += 1
                     if nonZeroIdx is None:
                         nonZeroIdx = i
-                    nonZerosFound += 1
+                    else:
+                        break
             if nonZerosFound > 1:
                 continue
             if nonZeroIdx is None:
@@ -50,16 +51,15 @@ def solveSimpleCoefficients(matrix, debug = False):
             solution = int(row[-1] // row[nonZeroIdx])
             if remainder != 0 or solution < 0:
                 return None
-            if sumOfSolvedCoefficients is None:
-                sumOfSolvedCoefficients = 0
             solvedCoefficients[nonZeroIdx] = solution
-            sumOfSolvedCoefficients += solution
-            pluggedInColumn = matrix[...,nonZeroIdx]*solution
-            matrix[...,-1] -= pluggedInColumn
+            if solution != 0:
+                sumOfSolvedCoefficients += solution
+                pluggedInColumn = matrix[...,nonZeroIdx]*solution
+                matrix[...,-1] -= pluggedInColumn
+                solving = True
             matrix[...,nonZeroIdx] = 0
-            solving = True
 
-    return (sumOfSolvedCoefficients, solvedCoefficients, matrix)
+    return (sumOfSolvedCoefficients, matrix)
 
 # try to identify fixed variables
 def optimizeMachine(matrix, debug = False):
@@ -67,65 +67,52 @@ def optimizeMachine(matrix, debug = False):
     # try to get rows that have a single 1 within them
 
     # start doing eliminations
-    ableToReduce = True
     totalSolvedSteps = 0
     coefficients = [None] * (matrix.shape[1] - 1)
 
-    while ableToReduce:
-        ableToReduce = False
+    def getRowWithLowestNonZero(matrix, coefficientIdx, startRow):
+        lowest = None
+        for row in range(startRow, matrix.shape[0]):
+            current = abs(matrix[row, coefficientIdx])
+            if current != 0:
+                if current == 1:
+                    return row
+                if lowest is None:
+                    lowest = row
+                elif current < abs(matrix[lowest, coefficientIdx]):
+                    lowest = row
+        return lowest
 
-        # for each coefficient slot (width - 1)
-        targetRow = 0
-        for coefficientIdx in range(matrix.shape[1] - 1):
-            # find the first non zero within the column for the coefficient we're targetting
-            firstNonZeroInColumn = None
-            for row in range(targetRow, matrix.shape[0]):
-                if matrix[row, coefficientIdx] != 0:
-                    if firstNonZeroInColumn is None:
-                        firstNonZeroInColumn = row
-                        # break
-                    elif abs(matrix[firstNonZeroInColumn, coefficientIdx]) > abs(matrix[row, coefficientIdx]):
-                        firstNonZeroInColumn = row
-            if firstNonZeroInColumn is None:
+    # for each coefficient slot (width - 1)
+    targetRow = 0
+    for coefficientIdx in range(matrix.shape[1] - 1):
+        # find the lowest non zero within the column for the coefficient we're targetting
+        # lowest is to hopefully be the most divisible to the other columns
+        rowWithLowestNonZero = getRowWithLowestNonZero(matrix, coefficientIdx, targetRow)
+        if rowWithLowestNonZero is None:
+            continue
+
+        if targetRow != rowWithLowestNonZero:
+            matrix[[targetRow, rowWithLowestNonZero]] = matrix[[rowWithLowestNonZero, targetRow]]
+
+        # take the row and use it to simplify all the other rows
+        coefficientToDivideWith = matrix[targetRow, coefficientIdx]
+        for j in range(matrix.shape[0]):
+            if j == targetRow:
                 continue
+            currentCoefficientInRow = matrix[j, coefficientIdx]
+            if currentCoefficientInRow != 0 and currentCoefficientInRow % coefficientToDivideWith == 0:
+                matrix[j] -= matrix[targetRow] * (currentCoefficientInRow // coefficientToDivideWith)
+        targetRow += 1
 
-            # swap that found row so coefficient #x is on row x
-            # if debug:
-            #     print(f"Before swap of {targetRow} and {firstNonZeroInColumn}")
-            #     prettyPrintMatrix(matrix, 3)
-            matrix[[targetRow, firstNonZeroInColumn]] = matrix[[firstNonZeroInColumn, targetRow]]
-            # if debug:
-            #     print(f"After swap of {targetRow} and {firstNonZeroInColumn}")
-            #     prettyPrintMatrix(matrix)
-            #     print()
+    # scan for solvable coefficients
+    x = solveSimpleCoefficients(matrix, coefficients)
+    if x is None:
+        return None
+    
+    sumOfTotalSolvedSteps, matrix = x
+    totalSolvedSteps += sumOfTotalSolvedSteps
 
-            # take the row and use it to simplify all the other rows
-            for j in range(matrix.shape[0]):
-                if j == targetRow:
-                    continue
-                if matrix[j, coefficientIdx] % matrix[targetRow, coefficientIdx] == 0:
-                    matrix[j] -= matrix[targetRow] * (matrix[j, coefficientIdx] // matrix[targetRow, coefficientIdx])
-                else:
-                    pass
-            # print(f"After using {targetRow} to simplify other rows")
-            # prettyPrintMatrix(matrix)
-            # print()
-            targetRow += 1
-
-        # scan for solvable coefficients
-        x = solveSimpleCoefficients(matrix, debug)
-        if x is not None:
-            sumOfTotalSolvedSteps, cs, matrix = x
-            if sumOfTotalSolvedSteps is not None:
-                totalSolvedSteps += sumOfTotalSolvedSteps
-                if sumOfTotalSolvedSteps > 0:
-                    ableToReduce = True
-            for i, c in enumerate(cs):
-                if c is not None:
-                    assert(coefficients[i] is None)
-                    coefficients[i] = c
-        else:
-            return None
     return totalSolvedSteps, coefficients, matrix
 
 def prettyPrintMatrix(matrix, tabs=0):
