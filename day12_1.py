@@ -192,9 +192,12 @@ def check(shapeRotations: list[list[np.typing.NDArray]], regionConstraint: tuple
             addShapeToRegion(visual, shapeRotations[hShapeIdx][hRotationIdx]*(i+1), hCoordinate)
             if i >= fromIdx:
                 for row in visual:
+                    print("|", end="")
                     for n in row:
+                        if n == 0:
+                            n = " "
                         print(n, end="")
-                    print()
+                    print("|")
                 print()
 
     startTime = time.perf_counter_ns()
