@@ -1,6 +1,11 @@
 import sys
 import numpy as np
 import time
+from tkinter import *
+from tkinter import ttk
+import threading
+import queue
+import random
 
 SHAPE_SIZE = 3
 
@@ -64,10 +69,12 @@ def addShapeToRegion(region: np.typing.NDArray, shape: np.typing.NDArray, coordi
     y, x = coordinate
     subRegion = region[y:y + shape.shape[0], x:x + shape.shape[1]]
 
-    if not np.any(subRegion & shape):
-        subRegion += shape
-        return True
-    return False
+    for i in range(shape.shape[0]):
+        for j in range(shape.shape[1]):
+            if shape[i, j] and subRegion[i, j]:
+                return False
+    subRegion += shape
+    return True
 
 def removeShapeFromRegion(region: np.typing.NDArray, shape: np.typing.NDArray, coordinate: tuple[int, int]):
     y, x = coordinate
@@ -236,7 +243,7 @@ def getRegionSymmetries(region: np.typing.NDArray):
             yield(tuple(map(int, np.ravel(np.fliplr(region)))))
             yield(tuple(map(int, np.ravel(np.flipud(region)))))
 
-def check(shapeRotations: list[list[np.typing.NDArray]], regionConstraint: tuple[tuple[int, int], list[int]], neighborsCache: dict[tuple[int, int], dict[tuple[int, int], set[tuple[int, int]]]], shapeVolumes: list[int]) -> bool:
+def check(shapeRotations: list[list[np.typing.NDArray]], regionConstraint: tuple[tuple[int, int], list[int]], neighborsCache: dict[tuple[int, int], dict[tuple[int, int], set[tuple[int, int]]]], shapeVolumes: list[int], outputQueue) -> bool:
     (regionWidth, regionHeight), presentCounts = regionConstraint
 
     emptyVolume = regionWidth * regionHeight
@@ -263,6 +270,8 @@ def check(shapeRotations: list[list[np.typing.NDArray]], regionConstraint: tuple
     lastTime = startTime
     iterations = 0
     symmetriesIgnored = 0
+    boundingBoxesIgnored = 0
+    lowestBacktrackedSinceLastDraw = 0
     frontiers: list[tuple[tuple[int, int], tuple[int, int], int]] = []
     for shapeIdx in range(len(shapeRotations)):
         if presentCounts[shapeIdx] == 0:
@@ -271,8 +280,17 @@ def check(shapeRotations: list[list[np.typing.NDArray]], regionConstraint: tuple
             frontiers.append(((0,0), (shapeIdx, rotationIdx), 0))
 
     visited = set()
+    bestBoundingBoxes = dict() # map from tuple of shapes added to set of best bounding box sizes
     historyStack = []
     while len(frontiers) > 0:
+        currentTime = time.perf_counter_ns()
+        elapsed = currentTime - lastTime
+        if elapsed > 1*1000000000:
+            elapsedSeconds = (currentTime - startTime) / 1000000000
+            outputQueue.put((region.shape, historyStack.copy(), lowestBacktrackedSinceLastDraw, iterations, elapsedSeconds, len(visited), len(frontiers), symmetriesIgnored, boundingBoxesIgnored))
+            lastTime = currentTime
+            lowestBacktrackedSinceLastDraw = len(historyStack)
+
         iterations += 1
         coordinate, (shapeIdx, rotationIdx), historyStackLen = frontiers.pop()
         shape = shapeRotations[shapeIdx][rotationIdx]
@@ -284,6 +302,8 @@ def check(shapeRotations: list[list[np.typing.NDArray]], regionConstraint: tuple
             removeShapeFromRegion(region, shapeRotations[hShapeIdx][hRotationIdx], hCoordinate)
             presentCounts[hShapeIdx] += 1
             backtracked = True
+        if backtracked:
+            lowestBacktrackedSinceLastDraw = min(lowestBacktrackedSinceLastDraw, historyStackLen)
         # if backtracked:
         #     visualizeHistoryStack(region.shape, historyStack, shapeRotations)
         #     visual = region * 4
@@ -306,13 +326,6 @@ def check(shapeRotations: list[list[np.typing.NDArray]], regionConstraint: tuple
 
         # see if a shape fits
         if not addShapeToRegion(region, shape, coordinate):
-            currentTime = time.perf_counter_ns()
-            if currentTime - lastTime > 5*1000000000:
-                lastTime = currentTime
-                elapsedSeconds = (currentTime - startTime) / 1000000000
-                print(f"On iteration {iterations} after {elapsedSeconds} secs | Visited set size = {len(visited)} | frontier size = {len(frontiers)}")
-                print(f"Ignored {symmetriesIgnored} symmetries")
-                visualizeHistoryStack(region.shape, historyStack, shapeRotations)
             continue
 
         historyStack.append((coordinate, (shapeIdx, rotationIdx)))
@@ -329,8 +342,28 @@ def check(shapeRotations: list[list[np.typing.NDArray]], regionConstraint: tuple
         visited.add(next(getRegionSymmetries(region)))
         if visitedBefore:
             continue
-        
-        # visualizeHistoryStack(region.shape, historyStack, shapeRotations, len(historyStack)-1)
+
+        historicalShapesKey = tuple(h[1][0] for h in historyStack)
+        currentBoundingBox = computeBoundingBoxSize(region)
+        if historicalShapesKey not in bestBoundingBoxes:
+            bestBoundingBoxes[historicalShapesKey] = set()
+        goodBounds = True
+        boundingBoxesToDelete = []
+        for bestBoundingBox in bestBoundingBoxes[historicalShapesKey]:
+            bbMatrix = np.array(list(bestBoundingBox))
+            if currentBoundingBox[0] < bbMatrix[0] and currentBoundingBox[1] < bbMatrix[1]:
+                boundingBoxesToDelete.append(bestBoundingBox)
+            elif currentBoundingBox[0] > bbMatrix[0] and currentBoundingBox[1] > bbMatrix[1]:
+                # our current shape configuration bounding box is strictly worse
+                goodBounds = False
+                break
+        if not goodBounds:
+            boundingBoxesIgnored += 1
+            continue
+        bestBoundingBoxes[historicalShapesKey].add(tuple(map(int, currentBoundingBox)))
+        for boundingBoxToDelete in boundingBoxesToDelete:
+            bestBoundingBoxes[historicalShapesKey].remove(boundingBoxToDelete)
+
 
         # Scan for end condition - we fit all the shapes!
         nonZeroFound = False
@@ -358,10 +391,7 @@ def check(shapeRotations: list[list[np.typing.NDArray]], regionConstraint: tuple
                 frontiers.append((possibleCoordinate, possibleNeighbor, historyStackLen + 1))
     return False
 
-def main():
-    shapes, regionConstraints = parseInput(sys.stdin)
-    shapeRotations = computeShapeRotations(shapes)
-
+def generate_data(outputQueue, shapes, regionConstraints, shapeRotations):
     shapeVolumes = [getShapeVolume(s) for s in shapes]
     
     # dbg = findShapeFrontier(shapes[0], shapeRotations)
@@ -379,8 +409,114 @@ def main():
     neighborsCache = computeShapeNeighborsCache(shapeRotations)
     print("Pairings between shapes", sum(len(innerV) for v in neighborsCache.values() for innerV in v.values()))
     for i, constraint in enumerate(regionConstraints[0:3]):
-        result = check(shapeRotations, constraint, neighborsCache, shapeVolumes)
+        result = check(shapeRotations, constraint, neighborsCache, shapeVolumes, outputQueue)
         print(f"Tree{i} = {result}")
+
+CANVAS_WIDTH = 1024
+CANVAS_HEIGHT = 1024
+class CanvasApp:
+    def __init__(self, root, inputQueue, shapeRotations):
+        self.root = root
+        self.queue = inputQueue
+        self.shapeRotations = shapeRotations
+        
+        self.root.title("Tkinter Canvas Example")
+
+        self.lastRegionShape = None
+        self.lastRegionTag = None
+        self.lastHistoryStack = None
+
+        self.leftText = None
+        self.rightText = None
+
+        def get_random_color():
+            # Generates a random color in #RRGGBB format
+            return f"#{random.randint(0, 0xFFFFFF):06x}"
+
+        self.colors = []
+        for _ in range(1000):
+            self.colors.append(get_random_color())
+        # Create the canvas widget
+        self.canvas = Canvas(root, width=CANVAS_WIDTH, height=CANVAS_HEIGHT, bg='white')
+        self.canvas.pack(padx=20, pady=20)
+        self.process_queue()
+    def process_queue(self):
+        queueItem = None
+        lowestBacktrackedSinceLastDraw = None
+        try:
+            while True:
+                queueItem = self.queue.get_nowait()
+                if lowestBacktrackedSinceLastDraw is not None:
+                    lowestBacktrackedSinceLastDraw = min(lowestBacktrackedSinceLastDraw, queueItem[2])
+                else:
+                    lowestBacktrackedSinceLastDraw = queueItem[2]
+        except queue.Empty:
+            pass
+        if queueItem is None:
+            self.root.after(100, self.process_queue)
+
+            return
+        regionShape, historyStack, _, iterations, elapsedSeconds, lenVisited, lenFrontiers, symmetriesIgnored, boundingBoxesIgnored = queueItem
+        
+        scaleFactor = min(CANVAS_WIDTH, CANVAS_HEIGHT) / max(regionShape) * 0.80
+        x1 = (CANVAS_WIDTH) / 2 - regionShape[1] / 2
+        y1 = (CANVAS_HEIGHT) / 2 - regionShape[0] / 2
+        if self.lastRegionShape is None:
+            self.regionTag = self.canvas.create_rectangle(x1, y1, x1 + regionShape[1], y1 + regionShape[0], outline="black")
+            self.canvas.scale(self.regionTag, CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2, scaleFactor, scaleFactor)
+        elif self.lastRegionShape != regionShape:
+            self.canvas.delete(self.regionTag)
+            self.regionTag = self.canvas.create_rectangle(x1, y1, x1 + regionShape[1], y1 + regionShape[0], outline="black")
+            self.canvas.scale(self.regionTag, CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2, scaleFactor, scaleFactor)
+            self.lastRegionShape = regionShape
+
+        deleteStart = min(len(historyStack), lowestBacktrackedSinceLastDraw)
+        if self.lastHistoryStack is not None:
+            # if len(self.lastHistoryStack) - lowestBacktrackedSinceLastDraw > 0:
+            for j in range(deleteStart, len(self.lastHistoryStack)):
+                self.canvas.delete(f"shape{j}")
+        #     print("last history", len(self.lastHistoryStack))
+        # print("     history", len(historyStack))
+        self.lastHistoryStack = historyStack
+
+        for i in range(deleteStart, len(historyStack)):
+            coordinate, (shapeIdx, shapeRotationIdx) = historyStack[i]
+            shape = self.shapeRotations[shapeIdx][shapeRotationIdx]
+            # print(f"Adding shape {i}")
+            shapeStrKey = f"shape{i}"
+            for y in range(shape.shape[0]):
+                for x in range(shape.shape[1]):
+                    if shape[y, x]:
+                        originX = x1 + coordinate[1] + x
+                        originY = y1 + coordinate[0] + y
+
+                        self.canvas.create_rectangle(originX, originY, originX+1, originY+1, fill=self.colors[i], outline=self.colors[i], tags=shapeStrKey)
+            self.canvas.scale(shapeStrKey, CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2, scaleFactor, scaleFactor)
+    
+        if self.leftText is None:
+            self.leftText = self.canvas.create_text(x1, y1 + regionShape[0], 
+                text=f"Iterations = {iterations}\nElapsed = {elapsedSeconds} seconds\nVisited = {lenVisited}",
+                anchor="nw", tags="info")
+            self.rightText = self.canvas.create_text(x1 + regionShape[1], y1 + regionShape[0],
+                text=f"Frontiers = {lenFrontiers}\nSymmetries ignored = {symmetriesIgnored}\nBounding boxes ignored= {boundingBoxesIgnored}",
+                anchor="ne", tags="info")
+            self.canvas.scale("info", CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2, scaleFactor, scaleFactor)
+        else:
+            self.canvas.itemconfig(self.leftText, text=f"Iterations = {iterations}\nElapsed = {elapsedSeconds} seconds\nVisited = {lenVisited}")
+            self.canvas.itemconfig(self.rightText, text=f"Frontiers = {lenFrontiers}\nSymmetries ignored = {symmetriesIgnored}\nBounding boxes ignored= {boundingBoxesIgnored}")
+
+        self.root.after(100, self.process_queue)
+
+def main():
+    shapes, regionConstraints = parseInput(sys.stdin)
+    shapeRotations = computeShapeRotations(shapes)
+
+    outputQueue = queue.Queue(maxsize=10)
+    workerThread = threading.Thread(daemon=True, target=generate_data, args=(outputQueue, shapes, regionConstraints, shapeRotations))
+    workerThread.start()
+    root = Tk()
+    app = CanvasApp(root, outputQueue, shapeRotations)
+    root.mainloop()
 
 if __name__ == '__main__':
     main()
