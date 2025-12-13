@@ -74,6 +74,17 @@ def removeShapeFromRegion(region: np.typing.NDArray, shape: np.typing.NDArray, c
     subRegion = region[y:y + shape.shape[0], x:x + shape.shape[1]]
     subRegion ^= shape
 
+def computeBoundingBoxSize(region) -> np.typing.NDArray:
+    """Return the bounding (height,width) of the region where the region is non-zero"""
+    nonzeros = np.nonzero(region)
+    mins = np.min(nonzeros, axis=1)
+    maxs = np.max(nonzeros, axis=1)
+    bounds = maxs - mins + np.array([1, 1])
+    return bounds
+
+def getShapeVolume(shape: np.typing.NDArray) -> int:
+    return int(np.count_nonzero(shape))
+
 def findShapeFrontier(shape: np.typing.NDArray, shapeRotations: list[list[np.typing.NDArray]]) -> dict[tuple[int, int], set[tuple[int, int]]]:
     """
     Returns a map from a particular shape rotation, to a set of coord offsets where that shape rotation could fit up against the given shape
@@ -111,8 +122,10 @@ def findShapeFrontier(shape: np.typing.NDArray, shapeRotations: list[list[np.typ
     tester = np.full((SHAPE_SIZE, SHAPE_SIZE), 0b10)
     for y in range(region.shape[0] - SHAPE_SIZE + 1):
         for x in range(region.shape[1] - SHAPE_SIZE + 1):
-            if region[y, x] == 0b10:
-                continue
+            # this is incorrect, the top left origin of the shape can share this square
+            # this works if the top left of the shape has a hole there
+            # if region[y, x] == 0b10:
+            #     continue
 
             testResult = tester - region[y:y+SHAPE_SIZE, x:x+SHAPE_SIZE]
             # the tester should intersect with a hole, in that case, the matrix will have a 1 since 2 - 1 = 1
@@ -133,28 +146,48 @@ def findShapeFrontier(shape: np.typing.NDArray, shapeRotations: list[list[np.typ
     addShapeToRegion(region, shape, (SHAPE_SIZE, SHAPE_SIZE))
     resultCoordinates = np.transpose(np.nonzero(result))
 
+    bestBoundingBoxes = dict() # map from bounding box -> map coordinate -> (shapeIdx, rotationIdx)
     cache = dict()
     for shapeIdx, testShape in enumerate(shapeRotations):
         for rotationIdx, testShapeRotation in enumerate(testShape):
             cacheKey = (shapeIdx, rotationIdx)
             for testCoordinate in resultCoordinates:
                 c = tuple(map(int, testCoordinate))
-                if addShapeToRegion(region, testShapeRotation, c):
-                    # There is still room for improvement here:
-                    # while bounding boxes touch the holes, there can still be a gap after the shape is placed
-                    # Example:
-                    # 222---
-                    # 22-111
-                    # 22-11-
-                    # ---11-
-                    # Here the '2' shape is placed and covers some holes left of '1', but there's a gap still
-                    # This is because our 'test' array wasn't a shape, but just a 3x3 brick
-                    removeShapeFromRegion(region, testShapeRotation, c)
-                    if cacheKey not in cache:
-                        cache[cacheKey] = set()
-                    # translate back to the shape's origin coordinates
-                    # we placed the shape at (SHAPE_SIZE, SHAPE_SIZE), so we subtract that
-                    cache[cacheKey].add((c[0] - SHAPE_SIZE, c[1] - SHAPE_SIZE))
+                if not addShapeToRegion(region, testShapeRotation, c):
+                    continue
+                boundingBox = computeBoundingBoxSize(region)
+                removeShapeFromRegion(region, testShapeRotation, c)
+
+                goodBounds = True
+                boundingBoxesToDelete = []
+                for bestBounds in bestBoundingBoxes.keys():
+                    bbMatrix = np.array(list(bestBounds))
+                    if boundingBox[0] < bbMatrix[0] and boundingBox[1] < bbMatrix[1] :
+                        # ours is strictly better
+                        boundingBoxesToDelete.append(bestBounds)
+                    elif boundingBox[0] > bbMatrix[0] and boundingBox[1] > bbMatrix[1]:
+                        # ours is worse than an existing
+                        goodBounds = False
+                        break
+                for boundingBoxToDelete in boundingBoxesToDelete:
+                    for coordinate in bestBoundingBoxes[boundingBoxToDelete].keys():
+                        cacheKeyToDelete = bestBoundingBoxes[boundingBoxToDelete][coordinate]
+                        coordinateAsCacheKey = (coordinate[0] - SHAPE_SIZE, coordinate[1] - SHAPE_SIZE)
+                        cache[cacheKeyToDelete].remove(coordinateAsCacheKey)
+                    del bestBoundingBoxes[boundingBoxToDelete]
+                if goodBounds:
+                    key = tuple(map(int, boundingBox))
+                    if key not in bestBoundingBoxes:
+                        bestBoundingBoxes[key] = dict()
+                    bestBoundingBoxes[key][c] = cacheKey
+                else:
+                    continue
+
+                if cacheKey not in cache:
+                    cache[cacheKey] = set()
+                # translate back to the shape's origin coordinates
+                # we placed the shape at (SHAPE_SIZE, SHAPE_SIZE), so we subtract that
+                cache[cacheKey].add((c[0] - SHAPE_SIZE, c[1] - SHAPE_SIZE))
     return cache
 
 def computeShapeNeighborsCache(shapeRotations: list[list[np.typing.NDArray]]) -> dict[tuple[int, int], dict[tuple[int, int], set[tuple[int, int]]]]:
@@ -164,8 +197,54 @@ def computeShapeNeighborsCache(shapeRotations: list[list[np.typing.NDArray]]) ->
             neighborOffsetCache[(shapeIdx, rotationIdx)] = findShapeFrontier(rotations, shapeRotations)
     return neighborOffsetCache
 
-def check(shapeRotations: list[list[np.typing.NDArray]], regionConstraint: tuple[tuple[int, int], list[int]], neighborsCache: dict[tuple[int, int], dict[tuple[int, int], set[tuple[int, int]]]]) -> bool:
+def prettyPrintIntRegion(region):
+    for row in region:
+        print("|", end="")
+        for n in row:
+            if n == 0:
+                n = " "
+            print(n, end="")
+        print("|")
+    print()
+
+
+def visualizeHistoryStack(regionShape, historyStack, shapeRotations, fromIdx = None):
+    """
+    prints out the region made from the given history stack visualizing each new shape as an int
+    this probably only works when there's less than 10 for now, formatting wise
+    """
+    visual = np.zeros(regionShape, dtype=int)
+    fromIdx = len(historyStack) - 1
+    for i, h in enumerate(historyStack):
+        hCoordinate, (hShapeIdx, hRotationIdx) = h
+        assert(addShapeToRegion(visual, shapeRotations[hShapeIdx][hRotationIdx]*(i+1), hCoordinate))
+        if i >= fromIdx:
+            prettyPrintIntRegion(visual)
+
+def getRegionSymmetries(region: np.typing.NDArray):
+    yield(tuple(map(int, np.ravel(region))))
+    if region[0, 0] == region[-1, -1] or region[0, 0] == region[0, -1] or region[0, 0] == region[-1, 0]:
+        one180Rotated = np.rot90(region, k = 2)
+        yield(tuple(map(int, np.ravel(one180Rotated))))
+        yield(tuple(map(int, np.ravel(np.fliplr(region)))))
+        yield(tuple(map(int, np.ravel(np.flipud(region)))))
+        if region.shape[0] == region.shape[1]:
+            region = np.rot90(region, k = 1)
+            yield(tuple(map(int, np.ravel(region))))
+            one180Rotated = np.rot90(region, k = 2)
+            yield(tuple(map(int, np.ravel(one180Rotated))))
+            yield(tuple(map(int, np.ravel(np.fliplr(region)))))
+            yield(tuple(map(int, np.ravel(np.flipud(region)))))
+
+def check(shapeRotations: list[list[np.typing.NDArray]], regionConstraint: tuple[tuple[int, int], list[int]], neighborsCache: dict[tuple[int, int], dict[tuple[int, int], set[tuple[int, int]]]], shapeVolumes: list[int]) -> bool:
     (regionWidth, regionHeight), presentCounts = regionConstraint
+
+    emptyVolume = regionWidth * regionHeight
+    requiredVolume = sum(shapeVolumes[i] * cnt for i, cnt in enumerate(presentCounts))
+    if emptyVolume < requiredVolume:
+        print(f"Empty volume {emptyVolume} < Required volume {requiredVolume}")
+        return False
+
     region = np.zeros((regionHeight, regionWidth), dtype=bool)
     # region under christmas tree
     #   <--- width --->
@@ -180,29 +259,10 @@ def check(shapeRotations: list[list[np.typing.NDArray]], regionConstraint: tuple
     # DFS to explore if there's a possibility
     # print(region[0:3, 0:3])
 
-    def visualizeHistoryStack(regionShape, historyStack, fromIdx = None):
-        """
-        prints out the region made from the given history stack visualizing each new shape as an int
-        this probably only works when there's less than 10 for now, formatting wise
-        """
-        visual = np.zeros(regionShape, dtype=int)
-        fromIdx = len(historyStack) - 1
-        for i, h in enumerate(historyStack):
-            hCoordinate, (hShapeIdx, hRotationIdx) = h
-            addShapeToRegion(visual, shapeRotations[hShapeIdx][hRotationIdx]*(i+1), hCoordinate)
-            if i >= fromIdx:
-                for row in visual:
-                    print("|", end="")
-                    for n in row:
-                        if n == 0:
-                            n = " "
-                        print(n, end="")
-                    print("|")
-                print()
-
     startTime = time.perf_counter_ns()
     lastTime = startTime
     iterations = 0
+    symmetriesIgnored = 0
     frontiers: list[tuple[tuple[int, int], tuple[int, int], int]] = []
     for shapeIdx in range(len(shapeRotations)):
         if presentCounts[shapeIdx] == 0:
@@ -217,78 +277,109 @@ def check(shapeRotations: list[list[np.typing.NDArray]], regionConstraint: tuple
         coordinate, (shapeIdx, rotationIdx), historyStackLen = frontiers.pop()
         shape = shapeRotations[shapeIdx][rotationIdx]
         
+        backtracked = False
         while len(historyStack) > historyStackLen:
             # backtrack
             hCoordinate, (hShapeIdx, hRotationIdx) = historyStack.pop()
             removeShapeFromRegion(region, shapeRotations[hShapeIdx][hRotationIdx], hCoordinate)
             presentCounts[hShapeIdx] += 1
+            backtracked = True
+        # if backtracked:
+        #     visualizeHistoryStack(region.shape, historyStack, shapeRotations)
+        #     visual = region * 4
+        #     currentExplorationLevel = set()
+        #     for f in frontiers:
+        #         if f[2] == historyStackLen:
+        #             currentExplorationLevel.add(f[0])
+        #             if visual[f[0]] & 4:
+        #                 visual[f[0]] = 6
+        #             else:
+        #                 visual[f[0]] = 1
+        #     tester = np.full((SHAPE_SIZE, SHAPE_SIZE), True, dtype=bool)
+        #     for s in shapeRotations:
+        #         for r in s:
+        #             tester &= r
+
+        #     prettyPrintIntRegion(visual)
+        #     prettyPrintIntRegion(tester * 1)
+        #     return
+
         # see if a shape fits
-        r = addShapeToRegion(region, shape, coordinate)
-        if r:
-            historyStack.append((coordinate, (shapeIdx, rotationIdx)))
-            presentCounts[shapeIdx] -= 1
-
-            # see if we visited this or the symmetries before
-            visitedKeys = []
-            for i in range(2):
-                rotated = np.rot90(region, k = i*2)
-                flip1 = np.fliplr(rotated)
-                flip2 = np.flipud(rotated)
-                visitedKeys.append(tuple(map(int, np.ravel(rotated))))
-                visitedKeys.append(tuple(map(int, np.ravel(flip1))))
-                visitedKeys.append(tuple(map(int, np.ravel(flip2))))
-            visitedBefore = False
-            for vk in visitedKeys:
-                if vk in visited:
-                    visitedBefore = True
-                    break
-            visited.update(visitedKeys)
-            if visitedBefore:
-                continue
-            
-
-            # Scan for end condition - we fit all the shapes!
-            nonZeroFound = False
-            for c in presentCounts:
-                if c != 0:
-                    nonZeroFound = True
-                    break
-            if not nonZeroFound:
-                visualizeHistoryStack(region.shape, historyStack, len(historyStack)-1)
-                return True
-
-            possibleNeighbors = dict()
-            cache = neighborsCache[shapeIdx, rotationIdx]
-            for key in cache:
-                if presentCounts[key[0]] == 0:
-                    continue
-                for c in cache[key]:
-                    c = (c[0] + coordinate[0], c[1] + coordinate[1])
-                    if 0 <= c[0] <= (region.shape[0] - SHAPE_SIZE) and 0 <= c[1] <= (region.shape[1] - SHAPE_SIZE):
-                        if key not in possibleNeighbors:
-                            possibleNeighbors[key] = list()
-                        possibleNeighbors[key].append(c)
-            for possibleNeighbor in possibleNeighbors.keys():
-                for possibleCoordinate in possibleNeighbors[possibleNeighbor]:
-                    frontiers.append((possibleCoordinate, possibleNeighbor, historyStackLen + 1))
-        else:
+        if not addShapeToRegion(region, shape, coordinate):
             currentTime = time.perf_counter_ns()
             if currentTime - lastTime > 5*1000000000:
                 lastTime = currentTime
                 elapsedSeconds = (currentTime - startTime) / 1000000000
                 print(f"On iteration {iterations} after {elapsedSeconds} secs | Visited set size = {len(visited)} | frontier size = {len(frontiers)}")
-                visualizeHistoryStack(region.shape, historyStack, len(historyStack)-1)
+                print(f"Ignored {symmetriesIgnored} symmetries")
+                visualizeHistoryStack(region.shape, historyStack, shapeRotations)
+            continue
 
+        historyStack.append((coordinate, (shapeIdx, rotationIdx)))
+        presentCounts[shapeIdx] -= 1
+
+        # see if we visited this or the symmetries before
+        visitedBefore = False
+        for i, vk in enumerate(getRegionSymmetries(region)):
+            if vk in visited:
+                if i > 0:
+                    symmetriesIgnored += 1
+                visitedBefore = True
+                break
+        visited.add(next(getRegionSymmetries(region)))
+        if visitedBefore:
+            continue
+        
+        # visualizeHistoryStack(region.shape, historyStack, shapeRotations, len(historyStack)-1)
+
+        # Scan for end condition - we fit all the shapes!
+        nonZeroFound = False
+        for c in presentCounts:
+            if c != 0:
+                nonZeroFound = True
+                break
+        if not nonZeroFound:
+            visualizeHistoryStack(region.shape, historyStack, shapeRotations, len(historyStack)-1)
+            return True
+
+        possibleNeighbors = dict()
+        cache = neighborsCache[shapeIdx, rotationIdx]
+        for key in cache:
+            if presentCounts[key[0]] == 0:
+                continue
+            for c in cache[key]:
+                c = (c[0] + coordinate[0], c[1] + coordinate[1])
+                if 0 <= c[0] <= (region.shape[0] - SHAPE_SIZE) and 0 <= c[1] <= (region.shape[1] - SHAPE_SIZE):
+                    if key not in possibleNeighbors:
+                        possibleNeighbors[key] = list()
+                    possibleNeighbors[key].append(c)
+        for possibleNeighbor in possibleNeighbors.keys():
+            for possibleCoordinate in possibleNeighbors[possibleNeighbor]:
+                frontiers.append((possibleCoordinate, possibleNeighbor, historyStackLen + 1))
     return False
-
 
 def main():
     shapes, regionConstraints = parseInput(sys.stdin)
     shapeRotations = computeShapeRotations(shapes)
-    neighborsCache = computeShapeNeighborsCache(shapeRotations)
 
-    for i, constraint in enumerate(regionConstraints):
-        result = check(shapeRotations, constraint, neighborsCache)
+    shapeVolumes = [getShapeVolume(s) for s in shapes]
+    
+    # dbg = findShapeFrontier(shapes[0], shapeRotations)
+    # for k in dbg.keys():
+    #     if k != (3,1):
+    #         continue
+    #     for c in dbg[k]:
+    #         c = (c[0] + SHAPE_SIZE, c[1] + SHAPE_SIZE)
+    #         historyStack = []
+    #         historyStack.append(((SHAPE_SIZE, SHAPE_SIZE), (0, 0)))
+    #         historyStack.append((c, k))
+    #         visualizeHistoryStack((SHAPE_SIZE*3, SHAPE_SIZE*3), historyStack, shapeRotations)
+    # print(sum(len(d) for d in dbg.values()))
+    # return
+    neighborsCache = computeShapeNeighborsCache(shapeRotations)
+    print("Pairings between shapes", sum(len(innerV) for v in neighborsCache.values() for innerV in v.values()))
+    for i, constraint in enumerate(regionConstraints[0:3]):
+        result = check(shapeRotations, constraint, neighborsCache, shapeVolumes)
         print(f"Tree{i} = {result}")
 
 if __name__ == '__main__':
