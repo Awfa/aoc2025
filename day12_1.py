@@ -272,6 +272,7 @@ def check(shapeRotations: list[list[np.typing.NDArray]], regionConstraint: tuple
     symmetriesIgnored = 0
     boundingBoxesIgnored = 0
     lowestBacktrackedSinceLastDraw = 0
+    hasUpdate = False
     frontiers: list[tuple[tuple[int, int], tuple[int, int], int]] = []
     for shapeIdx in range(len(shapeRotations)):
         if presentCounts[shapeIdx] == 0:
@@ -285,11 +286,12 @@ def check(shapeRotations: list[list[np.typing.NDArray]], regionConstraint: tuple
     while len(frontiers) > 0:
         currentTime = time.perf_counter_ns()
         elapsed = currentTime - lastTime
-        if elapsed > 1*1000000000:
+        if (elapsed > 1*1000000000 or hasUpdate) and not outputQueue.full():
             elapsedSeconds = (currentTime - startTime) / 1000000000
             outputQueue.put((region.shape, historyStack.copy(), lowestBacktrackedSinceLastDraw, iterations, elapsedSeconds, len(visited), len(frontiers), symmetriesIgnored, boundingBoxesIgnored))
             lastTime = currentTime
             lowestBacktrackedSinceLastDraw = len(historyStack)
+            hasUpdate = False
 
         iterations += 1
         coordinate, (shapeIdx, rotationIdx), historyStackLen = frontiers.pop()
@@ -304,25 +306,6 @@ def check(shapeRotations: list[list[np.typing.NDArray]], regionConstraint: tuple
             backtracked = True
         if backtracked:
             lowestBacktrackedSinceLastDraw = min(lowestBacktrackedSinceLastDraw, historyStackLen)
-        # if backtracked:
-        #     visualizeHistoryStack(region.shape, historyStack, shapeRotations)
-        #     visual = region * 4
-        #     currentExplorationLevel = set()
-        #     for f in frontiers:
-        #         if f[2] == historyStackLen:
-        #             currentExplorationLevel.add(f[0])
-        #             if visual[f[0]] & 4:
-        #                 visual[f[0]] = 6
-        #             else:
-        #                 visual[f[0]] = 1
-        #     tester = np.full((SHAPE_SIZE, SHAPE_SIZE), True, dtype=bool)
-        #     for s in shapeRotations:
-        #         for r in s:
-        #             tester &= r
-
-        #     prettyPrintIntRegion(visual)
-        #     prettyPrintIntRegion(tester * 1)
-        #     return
 
         # see if a shape fits
         if not addShapeToRegion(region, shape, coordinate):
@@ -389,23 +372,23 @@ def check(shapeRotations: list[list[np.typing.NDArray]], regionConstraint: tuple
         for possibleNeighbor in possibleNeighbors.keys():
             for possibleCoordinate in possibleNeighbors[possibleNeighbor]:
                 frontiers.append((possibleCoordinate, possibleNeighbor, historyStackLen + 1))
+        hasUpdate = hasUpdate or not outputQueue.full()
     return False
+
+def prettyPrintShapeFrontier(frontier, shapeRotations):
+    for k in frontier.keys():
+        if k != (3,1):
+            continue
+        for c in frontier[k]:
+            c = (c[0] + SHAPE_SIZE, c[1] + SHAPE_SIZE)
+            historyStack = []
+            historyStack.append(((SHAPE_SIZE, SHAPE_SIZE), (0, 0)))
+            historyStack.append((c, k))
+            visualizeHistoryStack((SHAPE_SIZE*3, SHAPE_SIZE*3), historyStack, shapeRotations)
 
 def generate_data(outputQueue, shapes, regionConstraints, shapeRotations):
     shapeVolumes = [getShapeVolume(s) for s in shapes]
     
-    # dbg = findShapeFrontier(shapes[0], shapeRotations)
-    # for k in dbg.keys():
-    #     if k != (3,1):
-    #         continue
-    #     for c in dbg[k]:
-    #         c = (c[0] + SHAPE_SIZE, c[1] + SHAPE_SIZE)
-    #         historyStack = []
-    #         historyStack.append(((SHAPE_SIZE, SHAPE_SIZE), (0, 0)))
-    #         historyStack.append((c, k))
-    #         visualizeHistoryStack((SHAPE_SIZE*3, SHAPE_SIZE*3), historyStack, shapeRotations)
-    # print(sum(len(d) for d in dbg.values()))
-    # return
     neighborsCache = computeShapeNeighborsCache(shapeRotations)
     print("Pairings between shapes", sum(len(innerV) for v in neighborsCache.values() for innerV in v.values()))
     for i, constraint in enumerate(regionConstraints[0:3]):
@@ -414,6 +397,7 @@ def generate_data(outputQueue, shapes, regionConstraints, shapeRotations):
 
 CANVAS_WIDTH = 1024
 CANVAS_HEIGHT = 1024
+UPDATE_TIME_MS = 300
 class CanvasApp:
     def __init__(self, root, inputQueue, shapeRotations):
         self.root = root
@@ -453,7 +437,7 @@ class CanvasApp:
         except queue.Empty:
             pass
         if queueItem is None:
-            self.root.after(100, self.process_queue)
+            self.root.after(UPDATE_TIME_MS, self.process_queue)
 
             return
         regionShape, historyStack, _, iterations, elapsedSeconds, lenVisited, lenFrontiers, symmetriesIgnored, boundingBoxesIgnored = queueItem
@@ -493,25 +477,27 @@ class CanvasApp:
                         self.canvas.create_rectangle(originX, originY, originX+1, originY+1, fill=self.colors[i], outline=self.colors[i], tags=shapeStrKey)
             self.canvas.scale(shapeStrKey, CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2, scaleFactor, scaleFactor)
     
+        leftText = f"Iterations = {iterations} ({iterations/elapsedSeconds:.0f} its/s)\nElapsed = {elapsedSeconds} seconds\nVisited = {lenVisited}"
+        rightText = f"Frontiers = {lenFrontiers}\nSymmetries ignored = {symmetriesIgnored}\nBounding boxes ignored= {boundingBoxesIgnored}"
         if self.leftText is None:
             self.leftText = self.canvas.create_text(x1, y1 + regionShape[0], 
-                text=f"Iterations = {iterations}\nElapsed = {elapsedSeconds} seconds\nVisited = {lenVisited}",
+                text=leftText,
                 anchor="nw", tags="info")
             self.rightText = self.canvas.create_text(x1 + regionShape[1], y1 + regionShape[0],
-                text=f"Frontiers = {lenFrontiers}\nSymmetries ignored = {symmetriesIgnored}\nBounding boxes ignored= {boundingBoxesIgnored}",
+                text=rightText,
                 anchor="ne", tags="info")
             self.canvas.scale("info", CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2, scaleFactor, scaleFactor)
         else:
-            self.canvas.itemconfig(self.leftText, text=f"Iterations = {iterations}\nElapsed = {elapsedSeconds} seconds\nVisited = {lenVisited}")
-            self.canvas.itemconfig(self.rightText, text=f"Frontiers = {lenFrontiers}\nSymmetries ignored = {symmetriesIgnored}\nBounding boxes ignored= {boundingBoxesIgnored}")
+            self.canvas.itemconfig(self.leftText, text=leftText)
+            self.canvas.itemconfig(self.rightText, text=rightText)
 
-        self.root.after(100, self.process_queue)
+        self.root.after(UPDATE_TIME_MS, self.process_queue)
 
 def main():
     shapes, regionConstraints = parseInput(sys.stdin)
     shapeRotations = computeShapeRotations(shapes)
 
-    outputQueue = queue.Queue(maxsize=10)
+    outputQueue = queue.Queue(maxsize=1)
     workerThread = threading.Thread(daemon=True, target=generate_data, args=(outputQueue, shapes, regionConstraints, shapeRotations))
     workerThread.start()
     root = Tk()
