@@ -214,7 +214,6 @@ def prettyPrintIntRegion(region):
         print("|")
     print()
 
-
 def visualizeHistoryStack(regionShape, historyStack, shapeRotations, fromIdx = None):
     """
     prints out the region made from the given history stack visualizing each new shape as an int
@@ -228,20 +227,37 @@ def visualizeHistoryStack(regionShape, historyStack, shapeRotations, fromIdx = N
         if i >= fromIdx:
             prettyPrintIntRegion(visual)
 
-def getRegionSymmetries(region: np.typing.NDArray):
-    yield(tuple(map(int, np.ravel(region))))
-    if region[0, 0] == region[-1, -1] or region[0, 0] == region[0, -1] or region[0, 0] == region[-1, 0]:
-        one180Rotated = np.rot90(region, k = 2)
-        yield(tuple(map(int, np.ravel(one180Rotated))))
-        yield(tuple(map(int, np.ravel(np.fliplr(region)))))
-        yield(tuple(map(int, np.ravel(np.flipud(region)))))
-        if region.shape[0] == region.shape[1]:
-            region = np.rot90(region, k = 1)
-            yield(tuple(map(int, np.ravel(region))))
-            one180Rotated = np.rot90(region, k = 2)
-            yield(tuple(map(int, np.ravel(one180Rotated))))
-            yield(tuple(map(int, np.ravel(np.fliplr(region)))))
-            yield(tuple(map(int, np.ravel(np.flipud(region)))))
+class RegionHistory:
+    """
+    Class to say whether a region has been visited before
+    Also checks for symmetry
+    """
+
+    def __init__(self):
+        self.symmetriesIgnored = 0
+        self.visited = set()
+    
+    def add(self, region) -> bool:
+        key = tuple(map(int, np.ravel(region)))
+        if key in self.visited:
+            return True
+        if region[0, 0] == region[-1, -1] or region[0, 0] == region[0, -1] or region[0, 0] == region[-1, 0]:
+            # symmetry spot check - one of the corners is the same as others
+            if tuple(map(int, np.ravel(np.rot90(region, k = 2)))) in self.visited or tuple(map(int, np.ravel(np.fliplr(region)))) in self.visited or tuple(map(int, np.ravel(np.flipud(region)))) in self.visited:
+                self.symmetriesIgnored += 1
+                self.visited.add(key)
+                return True
+            if region.shape[0] == region.shape[1]:
+                region = np.rot90(region, k = 1)
+                if tuple(map(int, np.ravel(np.rot90(region, k = 2)))) in self.visited or tuple(map(int, np.ravel(np.fliplr(region)))) in self.visited or tuple(map(int, np.ravel(np.flipud(region)))) in self.visited:
+                    self.symmetriesIgnored += 1
+                    self.visited.add(key)
+                    return True
+        self.visited.add(key)
+        return False
+    
+    def __len__(self):
+        return len(self.visited)
 
 def check(shapeRotations: list[list[np.typing.NDArray]], regionConstraint: tuple[tuple[int, int], list[int]], neighborsCache: dict[tuple[int, int], dict[tuple[int, int], set[tuple[int, int]]]], shapeVolumes: list[int], outputQueue) -> bool:
     (regionWidth, regionHeight), presentCounts = regionConstraint
@@ -251,6 +267,7 @@ def check(shapeRotations: list[list[np.typing.NDArray]], regionConstraint: tuple
     if emptyVolume < requiredVolume:
         print(f"Empty volume {emptyVolume} < Required volume {requiredVolume}")
         return False
+    presentsLeft = sum(cnt for cnt in presentCounts)
 
     region = np.zeros((regionHeight, regionWidth), dtype=bool)
     # region under christmas tree
@@ -269,10 +286,8 @@ def check(shapeRotations: list[list[np.typing.NDArray]], regionConstraint: tuple
     startTime = time.perf_counter_ns()
     lastTime = startTime
     iterations = 0
-    symmetriesIgnored = 0
     boundingBoxesIgnored = 0
     lowestBacktrackedSinceLastDraw = 0
-    hasUpdate = False
     frontiers: list[tuple[tuple[int, int], tuple[int, int], int]] = []
     for shapeIdx in range(len(shapeRotations)):
         if presentCounts[shapeIdx] == 0:
@@ -280,19 +295,11 @@ def check(shapeRotations: list[list[np.typing.NDArray]], regionConstraint: tuple
         for rotationIdx, shape in enumerate(shapeRotations[shapeIdx]):
             frontiers.append(((0,0), (shapeIdx, rotationIdx), 0))
 
-    visited = set()
-    bestBoundingBoxes = dict() # map from tuple of shapes added to set of best bounding box sizes
+    visited = RegionHistory()
+    # map from tuple of shapes added to set of best bounding box sizes
+    bestBoundingBoxes = dict()
     historyStack = []
     while len(frontiers) > 0:
-        currentTime = time.perf_counter_ns()
-        elapsed = currentTime - lastTime
-        if (elapsed > 1*1000000000 or hasUpdate) and not outputQueue.full():
-            elapsedSeconds = (currentTime - startTime) / 1000000000
-            outputQueue.put((region.shape, historyStack.copy(), lowestBacktrackedSinceLastDraw, iterations, elapsedSeconds, len(visited), len(frontiers), symmetriesIgnored, boundingBoxesIgnored))
-            lastTime = currentTime
-            lowestBacktrackedSinceLastDraw = len(historyStack)
-            hasUpdate = False
-
         iterations += 1
         coordinate, (shapeIdx, rotationIdx), historyStackLen = frontiers.pop()
         shape = shapeRotations[shapeIdx][rotationIdx]
@@ -303,9 +310,18 @@ def check(shapeRotations: list[list[np.typing.NDArray]], regionConstraint: tuple
             hCoordinate, (hShapeIdx, hRotationIdx) = historyStack.pop()
             removeShapeFromRegion(region, shapeRotations[hShapeIdx][hRotationIdx], hCoordinate)
             presentCounts[hShapeIdx] += 1
+            presentsLeft += 1
             backtracked = True
         if backtracked:
+            # if backtracked, update the gui window
             lowestBacktrackedSinceLastDraw = min(lowestBacktrackedSinceLastDraw, historyStackLen)
+            currentTime = time.perf_counter_ns()
+            elapsed = currentTime - lastTime
+            if elapsed > 1000000000 / 1000 * UPDATE_TIME_MS:
+                elapsedSeconds = (currentTime - startTime) / 1000000000
+                outputQueue.put((region.shape, historyStack.copy(), lowestBacktrackedSinceLastDraw, iterations, elapsedSeconds, len(visited), len(frontiers), visited.symmetriesIgnored, boundingBoxesIgnored))
+                lastTime = currentTime
+                lowestBacktrackedSinceLastDraw = len(historyStack)
 
         # see if a shape fits
         if not addShapeToRegion(region, shape, coordinate):
@@ -313,17 +329,9 @@ def check(shapeRotations: list[list[np.typing.NDArray]], regionConstraint: tuple
 
         historyStack.append((coordinate, (shapeIdx, rotationIdx)))
         presentCounts[shapeIdx] -= 1
+        presentsLeft -= 1
 
-        # see if we visited this or the symmetries before
-        visitedBefore = False
-        for i, vk in enumerate(getRegionSymmetries(region)):
-            if vk in visited:
-                if i > 0:
-                    symmetriesIgnored += 1
-                visitedBefore = True
-                break
-        visited.add(next(getRegionSymmetries(region)))
-        if visitedBefore:
+        if visited.add(region):
             continue
 
         historicalShapesKey = tuple(h[1][0] for h in historyStack)
@@ -349,15 +357,11 @@ def check(shapeRotations: list[list[np.typing.NDArray]], regionConstraint: tuple
 
 
         # Scan for end condition - we fit all the shapes!
-        nonZeroFound = False
-        for c in presentCounts:
-            if c != 0:
-                nonZeroFound = True
-                break
-        if not nonZeroFound:
+        if presentsLeft == 0:
             visualizeHistoryStack(region.shape, historyStack, shapeRotations, len(historyStack)-1)
             return True
 
+        # Find all possible neighbor (shape, rotation) -> their coordinates
         possibleNeighbors = dict()
         cache = neighborsCache[shapeIdx, rotationIdx]
         for key in cache:
@@ -367,12 +371,10 @@ def check(shapeRotations: list[list[np.typing.NDArray]], regionConstraint: tuple
                 c = (c[0] + coordinate[0], c[1] + coordinate[1])
                 if 0 <= c[0] <= (region.shape[0] - SHAPE_SIZE) and 0 <= c[1] <= (region.shape[1] - SHAPE_SIZE):
                     if key not in possibleNeighbors:
-                        possibleNeighbors[key] = list()
-                    possibleNeighbors[key].append(c)
-        for possibleNeighbor in possibleNeighbors.keys():
-            for possibleCoordinate in possibleNeighbors[possibleNeighbor]:
-                frontiers.append((possibleCoordinate, possibleNeighbor, historyStackLen + 1))
-        hasUpdate = hasUpdate or not outputQueue.full()
+                        possibleNeighbors[key] = set()
+                    if c not in possibleNeighbors[key]:
+                        possibleNeighbors[key].add(c)
+                        frontiers.append((c, key, historyStackLen + 1))
     return False
 
 def prettyPrintShapeFrontier(frontier, shapeRotations):
@@ -397,7 +399,7 @@ def generate_data(outputQueue, shapes, regionConstraints, shapeRotations):
 
 CANVAS_WIDTH = 1024
 CANVAS_HEIGHT = 1024
-UPDATE_TIME_MS = 300
+UPDATE_TIME_MS = 16
 class CanvasApp:
     def __init__(self, root, inputQueue, shapeRotations):
         self.root = root
@@ -446,21 +448,19 @@ class CanvasApp:
         x1 = (CANVAS_WIDTH) / 2 - regionShape[1] / 2
         y1 = (CANVAS_HEIGHT) / 2 - regionShape[0] / 2
         if self.lastRegionShape is None:
-            self.regionTag = self.canvas.create_rectangle(x1, y1, x1 + regionShape[1], y1 + regionShape[0], outline="black")
+            self.regionTag = "regionGrid"
+            self.canvas.create_rectangle(x1, y1, x1 + regionShape[1], y1 + regionShape[0], outline="black", tags="regionGrid")
             self.canvas.scale(self.regionTag, CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2, scaleFactor, scaleFactor)
         elif self.lastRegionShape != regionShape:
             self.canvas.delete(self.regionTag)
-            self.regionTag = self.canvas.create_rectangle(x1, y1, x1 + regionShape[1], y1 + regionShape[0], outline="black")
+            self.canvas.create_rectangle(x1, y1, x1 + regionShape[1], y1 + regionShape[0], outline="black", tags="regionGrid")
             self.canvas.scale(self.regionTag, CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2, scaleFactor, scaleFactor)
             self.lastRegionShape = regionShape
 
         deleteStart = min(len(historyStack), lowestBacktrackedSinceLastDraw)
         if self.lastHistoryStack is not None:
-            # if len(self.lastHistoryStack) - lowestBacktrackedSinceLastDraw > 0:
             for j in range(deleteStart, len(self.lastHistoryStack)):
                 self.canvas.delete(f"shape{j}")
-        #     print("last history", len(self.lastHistoryStack))
-        # print("     history", len(historyStack))
         self.lastHistoryStack = historyStack
 
         for i in range(deleteStart, len(historyStack)):
@@ -497,7 +497,7 @@ def main():
     shapes, regionConstraints = parseInput(sys.stdin)
     shapeRotations = computeShapeRotations(shapes)
 
-    outputQueue = queue.Queue(maxsize=1)
+    outputQueue = queue.Queue(maxsize=1024)
     workerThread = threading.Thread(daemon=True, target=generate_data, args=(outputQueue, shapes, regionConstraints, shapeRotations))
     workerThread.start()
     root = Tk()
